@@ -5,6 +5,8 @@ export interface ConversationDoc {
   workspace: string;
   contact: string;
   assignee?: string | null;
+  status?: string;
+  lastMessageAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -44,6 +46,15 @@ export interface WsEventDoc {
   _id?: any;
   workspace: string;
   seq: number;
+  type: string;
+  contact?: string;
+  message_id?: string;
+  client_ref?: string;
+  status?: string;
+  assignee?: string;
+  text?: string;
+  occurred_at?: any;
+  createdAt?: Date;
   [key: string]: any;
 }
 

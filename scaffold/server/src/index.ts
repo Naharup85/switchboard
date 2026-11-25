@@ -11,6 +11,7 @@ import {
   type OutboundMessageDoc,
   type ProcessedEventDoc,
 } from './store.js';
+import { startWorkers } from './worker.js';
 
 const app = express();
 
@@ -457,6 +458,9 @@ app.post('/__grader/reply', async (req, res) => {
 
 // Initialize database indexes before listening
 await ensureIndexes();
+
+// Start outbound message workers
+startWorkers(4);
 
 const server = createServer(app);
 server.listen(config.port, () => {
