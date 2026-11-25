@@ -1,5 +1,6 @@
 import express from 'express';
 import { createServer } from 'node:http';
+import crypto from 'node:crypto';
 import { config } from './config.js';
 import { getDb } from './db.js';
 import { getRedis } from './redis.js';
@@ -8,15 +9,248 @@ import {
   type ConversationDoc,
   type InboundMessageDoc,
   type OutboundMessageDoc,
+  type ProcessedEventDoc,
 } from './store.js';
 
 const app = express();
 
-app.use(express.json());
-
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
 });
+
+// Helper for Pigeon webhook signature verification
+function verifyPigeonSignature(
+  rawBody: Buffer,
+  signatureHeader: string | undefined,
+  secret: string
+): boolean {
+  if (!signatureHeader || typeof signatureHeader !== 'string') {
+    return false;
+  }
+
+  const parts = signatureHeader.split(',').map((p) => p.trim());
+  let tStr: string | undefined;
+  let v1: string | undefined;
+
+  for (const part of parts) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = part.slice(0, eqIdx);
+    const value = part.slice(eqIdx + 1);
+    if (key === 't') tStr = value;
+    else if (key === 'v1') v1 = value;
+  }
+
+  if (!tStr || !v1) {
+    return false;
+  }
+
+  if (!/^\d+$/.test(tStr)) {
+    return false;
+  }
+
+  if (!/^[0-9a-fA-F]{64}$/.test(v1)) {
+    return false;
+  }
+
+  const t = Number(tStr);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - t) > 300) {
+    return false;
+  }
+
+  const hmac = crypto.createHmac('sha256', secret);
+  hmac.update(`${tStr}.`);
+  hmac.update(rawBody);
+  const computedHex = hmac.digest('hex');
+
+  const v1Buf = Buffer.from(v1, 'hex');
+  const compBuf = Buffer.from(computedHex, 'hex');
+
+  if (v1Buf.length !== 32 || compBuf.length !== 32) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(v1Buf, compBuf);
+}
+
+// POST /webhooks/pigeon must be registered before express.json()
+app.post('/webhooks/pigeon', express.raw({ type: '*/*' }), async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.from(req.body || '');
+
+  // 1. Signature validation - 401 if missing, malformed or invalid (never 5xx)
+  let sigValid = false;
+  try {
+    const sigHeader = req.headers['x-pigeon-signature'];
+    sigValid = typeof sigHeader === 'string' && verifyPigeonSignature(rawBody, sigHeader, config.pigeon.webhookSecret);
+  } catch {
+    sigValid = false;
+  }
+
+  if (!sigValid) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  // 2. Parse JSON body after signature validation - 400 on invalid JSON (never 5xx)
+  let body: any;
+  try {
+    body = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    return res.status(400).json({ error: 'invalid JSON' });
+  }
+
+  if (!body || typeof body !== 'object') {
+    return res.status(400).json({ error: 'invalid body' });
+  }
+
+  const { id: event_id, type, workspace, occurred_at, data } = body;
+
+  // 3. Return 200 and ignore unknown workspace or unknown type
+  if (!workspace || !(workspace in config.pigeon.apiKeys)) {
+    return res.status(200).json({ ok: true, ignored: 'unknown workspace' });
+  }
+
+  if (type !== 'message.inbound' && type !== 'message.status') {
+    return res.status(200).json({ ok: true, ignored: 'unknown type' });
+  }
+
+  try {
+    const db = await getDb();
+
+    // 4. Handle message.inbound
+    if (type === 'message.inbound') {
+      const contact = data?.from;
+      const message_id = data?.message_id;
+      const text = data?.text ?? '';
+
+      if (!contact || !message_id) {
+        return res.status(200).json({ ok: true, ignored: 'missing contact or message_id' });
+      }
+
+      // Upsert conversation
+      try {
+        await db.collection<ConversationDoc>('conversations').updateOne(
+          { workspace, contact },
+          {
+            $setOnInsert: {
+              workspace,
+              contact,
+              assignee: null,
+              createdAt: new Date(),
+            },
+            $set: {
+              updatedAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+      } catch (err: any) {
+        if (err.code !== 11000) throw err;
+      }
+
+      // Idempotently insert inbound message
+      try {
+        await db.collection<InboundMessageDoc>('inbound_messages').insertOne({
+          workspace,
+          contact,
+          message_id,
+          text,
+          occurred_at: occurred_at ?? new Date().toISOString(),
+          createdAt: new Date(),
+        });
+      } catch (err: any) {
+        if (err.code !== 11000) throw err;
+      }
+
+      // Record event_id in processed_events
+      if (event_id) {
+        try {
+          await db.collection<ProcessedEventDoc>('processed_events').insertOne({
+            event_id,
+            processed_at: new Date(),
+          });
+        } catch (err: any) {
+          if (err.code !== 11000) throw err;
+        }
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    // 5. Handle message.status
+    if (type === 'message.status') {
+      const client_ref = data?.client_ref;
+      const pigeonMessageId = data?.message_id;
+      const newStatus = data?.status;
+
+      if (!client_ref && !pigeonMessageId) {
+        return res.status(200).json({ ok: true, ignored: 'no client_ref or message_id' });
+      }
+
+      const query: any = {};
+      if (client_ref && pigeonMessageId) {
+        query.$or = [{ client_ref }, { pigeon_message_id: pigeonMessageId }];
+      } else if (client_ref) {
+        query.client_ref = client_ref;
+      } else {
+        query.pigeon_message_id = pigeonMessageId;
+      }
+
+      const existing = await db.collection<OutboundMessageDoc>('outbound_messages').findOne(query);
+      if (!existing) {
+        return res.status(200).json({ ok: true, ignored: 'message not in outbound_messages' });
+      }
+
+      const updateSet: any = { updatedAt: new Date() };
+      if (pigeonMessageId && !existing.pigeon_message_id) {
+        updateSet.pigeon_message_id = pigeonMessageId;
+      }
+
+      // Advance status monotonically: queued < sent < delivered/failed
+      if (newStatus === 'delivered' || newStatus === 'failed') {
+        updateSet.status = newStatus;
+        await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
+          { _id: existing._id, status: { $in: ['queued', 'sent'] } },
+          { $set: updateSet }
+        );
+      } else if (newStatus === 'sent') {
+        updateSet.status = newStatus;
+        await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
+          { _id: existing._id, status: 'queued' },
+          { $set: updateSet }
+        );
+      } else if (pigeonMessageId && !existing.pigeon_message_id) {
+        await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
+          { _id: existing._id },
+          { $set: { pigeon_message_id: pigeonMessageId, updatedAt: new Date() } }
+        );
+      }
+
+      // Record event_id in processed_events
+      if (event_id) {
+        try {
+          await db.collection<ProcessedEventDoc>('processed_events').insertOne({
+            event_id,
+            processed_at: new Date(),
+          });
+        } catch (err: any) {
+          if (err.code !== 11000) throw err;
+        }
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'webhook error' });
+  }
+});
+
+// JSON body parser for subsequent routes
+app.use(express.json());
 
 // Grader authentication middleware
 app.use('/__grader', (req, res, next) => {

@@ -1,6 +1,7 @@
 import { getDb } from './db.js';
 
 export interface ConversationDoc {
+  _id?: any;
   workspace: string;
   contact: string;
   assignee?: string | null;
@@ -9,6 +10,7 @@ export interface ConversationDoc {
 }
 
 export interface InboundMessageDoc {
+  _id?: any;
   workspace: string;
   contact: string;
   message_id: string;
@@ -18,6 +20,7 @@ export interface InboundMessageDoc {
 }
 
 export interface OutboundMessageDoc {
+  _id?: any;
   client_ref: string;
   workspace: string;
   contact: string;
@@ -26,16 +29,19 @@ export interface OutboundMessageDoc {
   attempts: number;
   lockedUntil: number;
   nextAttemptAt: number;
+  pigeon_message_id?: string;
   createdAt?: Date;
   updatedAt?: Date;
 }
 
 export interface ProcessedEventDoc {
+  _id?: any;
   event_id: string;
   processed_at?: Date;
 }
 
 export interface WsEventDoc {
+  _id?: any;
   workspace: string;
   seq: number;
   [key: string]: any;
