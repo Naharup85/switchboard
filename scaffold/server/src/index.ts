@@ -11,9 +11,26 @@ import {
   type OutboundMessageDoc,
   type ProcessedEventDoc,
 } from './store.js';
-import { startWorkers } from './worker.js';
+import { startWorkers, stopWorkers } from './worker.js';
+import { authRouter, requireAuth, requireWorkspace } from './auth.js';
+import { setupWebSocket, publishWsEvent } from './realtime.js';
 
 const app = express();
+
+// CORS middleware supporting credentials
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-grader-token');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
@@ -85,7 +102,9 @@ app.post('/webhooks/pigeon', express.raw({ type: '*/*' }), async (req, res) => {
   let sigValid = false;
   try {
     const sigHeader = req.headers['x-pigeon-signature'];
-    sigValid = typeof sigHeader === 'string' && verifyPigeonSignature(rawBody, sigHeader, config.pigeon.webhookSecret);
+    sigValid =
+      typeof sigHeader === 'string' &&
+      verifyPigeonSignature(rawBody, sigHeader, config.pigeon.webhookSecret);
   } catch {
     sigValid = false;
   }
@@ -143,6 +162,7 @@ app.post('/webhooks/pigeon', express.raw({ type: '*/*' }), async (req, res) => {
             },
             $set: {
               updatedAt: new Date(),
+              lastMessageAt: new Date(occurred_at || Date.now()),
             },
           },
           { upsert: true }
@@ -152,17 +172,32 @@ app.post('/webhooks/pigeon', express.raw({ type: '*/*' }), async (req, res) => {
       }
 
       // Idempotently insert inbound message
+      let inserted = false;
       try {
-        await db.collection<InboundMessageDoc>('inbound_messages').insertOne({
-          workspace,
+        const insertRes = await db
+          .collection<InboundMessageDoc>('inbound_messages')
+          .insertOne({
+            workspace,
+            contact,
+            message_id,
+            text,
+            occurred_at: occurred_at ?? new Date().toISOString(),
+            createdAt: new Date(),
+          });
+        inserted = !!insertRes?.acknowledged;
+      } catch (err: any) {
+        if (err.code !== 11000) throw err;
+      }
+
+      // Publish real-time event if newly inserted
+      if (inserted) {
+        await publishWsEvent(workspace, {
+          type: 'message.inbound',
           contact,
           message_id,
           text,
           occurred_at: occurred_at ?? new Date().toISOString(),
-          createdAt: new Date(),
         });
-      } catch (err: any) {
-        if (err.code !== 11000) throw err;
       }
 
       // Record event_id in processed_events
@@ -199,9 +234,13 @@ app.post('/webhooks/pigeon', express.raw({ type: '*/*' }), async (req, res) => {
         query.pigeon_message_id = pigeonMessageId;
       }
 
-      const existing = await db.collection<OutboundMessageDoc>('outbound_messages').findOne(query);
+      const existing = await db
+        .collection<OutboundMessageDoc>('outbound_messages')
+        .findOne(query);
       if (!existing) {
-        return res.status(200).json({ ok: true, ignored: 'message not in outbound_messages' });
+        return res
+          .status(200)
+          .json({ ok: true, ignored: 'message not in outbound_messages' });
       }
 
       const updateSet: any = { updatedAt: new Date() };
@@ -210,23 +249,39 @@ app.post('/webhooks/pigeon', express.raw({ type: '*/*' }), async (req, res) => {
       }
 
       // Advance status monotonically: queued < sent < delivered/failed
+      let statusAdvanced = false;
       if (newStatus === 'delivered' || newStatus === 'failed') {
         updateSet.status = newStatus;
-        await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
-          { _id: existing._id, status: { $in: ['queued', 'sent'] } },
-          { $set: updateSet }
-        );
+        const resUpdate = await db
+          .collection<OutboundMessageDoc>('outbound_messages')
+          .updateOne(
+            { _id: existing._id, status: { $in: ['queued', 'sent'] } },
+            { $set: updateSet }
+          );
+        statusAdvanced = resUpdate.modifiedCount > 0;
       } else if (newStatus === 'sent') {
         updateSet.status = newStatus;
-        await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
-          { _id: existing._id, status: 'queued' },
-          { $set: updateSet }
-        );
+        const resUpdate = await db
+          .collection<OutboundMessageDoc>('outbound_messages')
+          .updateOne(
+            { _id: existing._id, status: 'queued' },
+            { $set: updateSet }
+          );
+        statusAdvanced = resUpdate.modifiedCount > 0;
       } else if (pigeonMessageId && !existing.pigeon_message_id) {
         await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
           { _id: existing._id },
           { $set: { pigeon_message_id: pigeonMessageId, updatedAt: new Date() } }
         );
+      }
+
+      if (statusAdvanced) {
+        await publishWsEvent(workspace, {
+          type: 'message.status',
+          contact: existing.contact,
+          client_ref: existing.client_ref,
+          status: newStatus,
+        });
       }
 
       // Record event_id in processed_events
@@ -252,6 +307,189 @@ app.post('/webhooks/pigeon', express.raw({ type: '*/*' }), async (req, res) => {
 
 // JSON body parser for subsequent routes
 app.use(express.json());
+
+// Auth routes (/auth/login, /auth/callback)
+app.use('/auth', authRouter);
+
+// GET /api/me
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json((req as any).user);
+});
+
+// GET /api/conversations?workspace=<id>
+app.get('/api/conversations', requireAuth, requireWorkspace, async (req, res) => {
+  const ws = req.query.workspace as string;
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+  const skip = Number(req.query.skip) || 0;
+
+  const db = await getDb();
+  const convs = await db
+    .collection<ConversationDoc>('conversations')
+    .find({ workspace: ws })
+    .sort({ lastMessageAt: -1, updatedAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .toArray();
+
+  res.json({ conversations: convs });
+});
+
+// GET /api/conversations/:contact/messages?workspace=<id>
+app.get('/api/conversations/:contact/messages', requireAuth, requireWorkspace, async (req, res) => {
+  const ws = req.query.workspace as string;
+  const contact = req.params.contact;
+
+  const db = await getDb();
+  const [inbounds, outbounds] = await Promise.all([
+    db.collection<InboundMessageDoc>('inbound_messages').find({ workspace: ws, contact }).toArray(),
+    db.collection<OutboundMessageDoc>('outbound_messages').find({ workspace: ws, contact }).toArray(),
+  ]);
+
+  const messages = [
+    ...inbounds.map((m) => ({
+      id: m.message_id,
+      direction: 'inbound',
+      contact: m.contact,
+      text: m.text,
+      occurred_at: m.occurred_at,
+      timestamp: new Date(m.occurred_at).getTime(),
+    })),
+    ...outbounds.map((m) => ({
+      id: m.client_ref,
+      client_ref: m.client_ref,
+      direction: 'outbound',
+      contact: m.contact,
+      text: m.text,
+      status: m.status,
+      occurred_at: m.createdAt,
+      timestamp: new Date(m.createdAt || 0).getTime(),
+    })),
+  ].sort((a, b) => a.timestamp - b.timestamp);
+
+  res.json({ messages });
+});
+
+// POST /api/conversations/:contact/claim
+app.post('/api/conversations/:contact/claim', requireAuth, requireWorkspace, async (req, res) => {
+  const ws = (req.query.workspace || req.body?.workspace) as string;
+  const contact = req.params.contact;
+  const agent = (req as any).user.sub;
+
+  const db = await getDb();
+  try {
+    const result = await db.collection<ConversationDoc>('conversations').findOneAndUpdate(
+      {
+        workspace: ws,
+        contact,
+        $or: [{ assignee: null }, { assignee: agent }],
+      },
+      {
+        $set: { assignee: agent, updatedAt: new Date() },
+        $setOnInsert: { createdAt: new Date() },
+      },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    if (result) {
+      await publishWsEvent(ws, {
+        type: 'conversation.assigned',
+        contact,
+        assignee: agent,
+      });
+      return res.status(200).json({ ok: true, assignee: agent });
+    }
+    return res.status(409).json({ error: 'already held by another agent' });
+  } catch (err: any) {
+    if (err.code === 11000) {
+      const existing = await db
+        .collection<ConversationDoc>('conversations')
+        .findOne({ workspace: ws, contact });
+      if (existing && existing.assignee === agent) {
+        return res.status(200).json({ ok: true, assignee: agent });
+      }
+      return res.status(409).json({ error: 'already held by another agent' });
+    }
+    return res.status(500).json({ error: err.message || 'claim failed' });
+  }
+});
+
+// POST /api/conversations/:contact/reply
+app.post('/api/conversations/:contact/reply', requireAuth, requireWorkspace, async (req, res) => {
+  const ws = (req.query.workspace || req.body?.workspace) as string;
+  const contact = req.params.contact;
+  const { text, client_ref } = req.body || {};
+
+  if (!text) {
+    return res.status(400).json({ error: 'text is required' });
+  }
+
+  const ref =
+    client_ref || 'ref_' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  const db = await getDb();
+
+  // Upsert conversation
+  try {
+    await db.collection<ConversationDoc>('conversations').updateOne(
+      { workspace: ws, contact },
+      {
+        $setOnInsert: {
+          workspace: ws,
+          contact,
+          assignee: null,
+          createdAt: new Date(),
+        },
+        $set: {
+          updatedAt: new Date(),
+          lastMessageAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+  } catch (err: any) {
+    if (err.code !== 11000) throw err;
+  }
+
+  // Idempotently insert into outbound_messages
+  try {
+    await db.collection<OutboundMessageDoc>('outbound_messages').insertOne({
+      client_ref: ref,
+      workspace: ws,
+      contact,
+      text,
+      status: 'queued',
+      attempts: 0,
+      lockedUntil: 0,
+      nextAttemptAt: Date.now(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+  } catch (err: any) {
+    if (err.code !== 11000) throw err;
+  }
+
+  return res.status(202).json({ ok: true, client_ref: ref, status: 'queued' });
+});
+
+// POST /api/conversations/:contact/status
+app.post('/api/conversations/:contact/status', requireAuth, requireWorkspace, async (req, res) => {
+  const ws = (req.query.workspace || req.body?.workspace) as string;
+  const contact = req.params.contact;
+  const { status } = req.body || {};
+
+  if (status !== 'open' && status !== 'closed') {
+    return res.status(400).json({ error: 'status must be open or closed' });
+  }
+
+  const db = await getDb();
+  await db.collection<ConversationDoc>('conversations').updateOne(
+    { workspace: ws, contact },
+    {
+      $set: { status, updatedAt: new Date() },
+    }
+  );
+
+  return res.status(200).json({ ok: true, status });
+});
 
 // Grader authentication middleware
 app.use('/__grader', (req, res, next) => {
@@ -329,8 +567,14 @@ app.get('/__grader/snapshot', async (_req, res) => {
 
     // Sort inbound messages by occurred_at ascending
     inboundMsgs.sort((a, b) => {
-      const ta = typeof a.occurred_at === 'number' ? a.occurred_at : new Date(a.occurred_at).getTime();
-      const tb = typeof b.occurred_at === 'number' ? b.occurred_at : new Date(b.occurred_at).getTime();
+      const ta =
+        typeof a.occurred_at === 'number'
+          ? a.occurred_at
+          : new Date(a.occurred_at).getTime();
+      const tb =
+        typeof b.occurred_at === 'number'
+          ? b.occurred_at
+          : new Date(b.occurred_at).getTime();
       const diff = (isNaN(ta) ? 0 : ta) - (isNaN(tb) ? 0 : tb);
       if (diff !== 0) return diff;
       return a.message_id.localeCompare(b.message_id);
@@ -382,13 +626,20 @@ app.post('/__grader/claim', async (req, res) => {
     );
 
     if (result) {
+      await publishWsEvent(workspace, {
+        type: 'conversation.assigned',
+        contact,
+        assignee: agent,
+      });
       return res.status(200).json({ ok: true, assignee: agent });
     }
     return res.status(409).json({ error: 'already held by another agent' });
   } catch (err: any) {
     if (err.code === 11000) {
       const db = await getDb();
-      const existing = await db.collection<ConversationDoc>('conversations').findOne({ workspace, contact });
+      const existing = await db
+        .collection<ConversationDoc>('conversations')
+        .findOne({ workspace, contact });
       if (existing && existing.assignee === agent) {
         return res.status(200).json({ ok: true, assignee: agent });
       }
@@ -424,6 +675,7 @@ app.post('/__grader/reply', async (req, res) => {
           },
           $set: {
             updatedAt: new Date(),
+            lastMessageAt: new Date(),
           },
         },
         { upsert: true }
@@ -463,6 +715,19 @@ await ensureIndexes();
 startWorkers(4);
 
 const server = createServer(app);
+
+// Setup WebSocket server with upgrade handling
+setupWebSocket(server);
+
 server.listen(config.port, () => {
   console.log(`server on http://localhost:${config.port}`);
 });
+
+const shutdown = () => {
+  stopWorkers();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1000).unref();
+};
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
