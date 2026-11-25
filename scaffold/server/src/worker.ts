@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { getDb } from './db.js';
 import { getRedis } from './redis.js';
 import type { OutboundMessageDoc } from './store.js';
+import { publishWsEvent } from './realtime.js';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -193,7 +194,7 @@ async function processMessage(msg: OutboundMessageDoc, db: Db, redis: Redis) {
     }
 
     // Atomically update status from 'queued' to 'sent' (preserving 'delivered' if already set by webhook)
-    await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
+    const updateRes = await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
       { _id: msg._id, status: 'queued' },
       {
         $set: {
@@ -202,6 +203,15 @@ async function processMessage(msg: OutboundMessageDoc, db: Db, redis: Redis) {
         },
       }
     );
+
+    if (updateRes.modifiedCount > 0) {
+      await publishWsEvent(msg.workspace, {
+        type: 'message.status',
+        contact: msg.contact,
+        client_ref: msg.client_ref,
+        status: 'sent',
+      });
+    }
 
     await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
       { _id: msg._id },

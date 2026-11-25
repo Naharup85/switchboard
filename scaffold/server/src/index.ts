@@ -13,7 +13,7 @@ import {
 } from './store.js';
 import { startWorkers, stopWorkers } from './worker.js';
 import { authRouter, requireAuth, requireWorkspace } from './auth.js';
-import { setupWebSocket, publishWsEvent } from './realtime.js';
+import { setupWebSocket, publishWsEvent, initRealtime } from './realtime.js';
 
 const app = express();
 
@@ -710,6 +710,9 @@ app.post('/__grader/reply', async (req, res) => {
 
 // Initialize database indexes before listening
 await ensureIndexes();
+
+// Initialize real-time Redis pub/sub
+await initRealtime();
 
 // Start outbound message workers
 startWorkers(4);
