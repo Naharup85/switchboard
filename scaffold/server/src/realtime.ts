@@ -16,7 +16,7 @@ interface ClientEntry {
 const clientsByWorkspace = new Map<string, Set<ClientEntry>>();
 let subRedisClient: any = null;
 
-export function broadcastToLocalClients(workspace: string, message: string, seq: number): void {
+function broadcastToClients(workspace: string, message: string, seq: number): void {
   const clients = clientsByWorkspace.get(workspace);
   if (!clients || clients.size === 0) return;
 
@@ -48,7 +48,7 @@ export async function initRealtime(): Promise<void> {
     const workspace = parts[1];
     try {
       const frame = JSON.parse(message);
-      broadcastToLocalClients(workspace, message, frame.seq);
+      broadcastToClients(workspace, message, frame.seq);
     } catch {
       // ignore malformed message
     }
@@ -85,10 +85,7 @@ export async function publishWsEvent(
 
   const jsonStr = JSON.stringify(frame);
 
-  // Broadcast to local clients immediately
-  broadcastToLocalClients(workspace, jsonStr, frame.seq);
-
-  // Broadcast over Redis Pub/Sub to other instances
+  // Broadcast over Redis Pub/Sub to all instances in serialized FIFO order
   await redis.publish(`ws:${workspace}:live`, jsonStr);
   return frame;
 }
@@ -174,10 +171,11 @@ async function handleClientConnection(
     clientsByWorkspace.set(workspace, clients);
   }
 
+  // Subscribe/add to active clients map immediately while buffering live messages
   const client: ClientEntry = {
     ws,
     workspace,
-    ready: after === undefined,
+    ready: false,
     lastSentSeq: after !== undefined ? after : -1,
     buffer: [],
   };
@@ -201,6 +199,25 @@ async function handleClientConnection(
         .toArray();
 
       for (const doc of missed) {
+        if (ws.readyState !== WebSocket.OPEN) break;
+        const { _id, createdAt, ...frame } = doc;
+        if (frame.seq > client.lastSentSeq) {
+          ws.send(JSON.stringify(frame));
+          client.lastSentSeq = frame.seq;
+        }
+      }
+    } else {
+      // Without after parameter: query ws_events created within the last 2 seconds
+      const recent = await db
+        .collection<WsEventDoc>('ws_events')
+        .find({
+          workspace,
+          createdAt: { $gte: new Date(Date.now() - 2000) },
+        })
+        .sort({ seq: 1 })
+        .toArray();
+
+      for (const doc of recent) {
         if (ws.readyState !== WebSocket.OPEN) break;
         const { _id, createdAt, ...frame } = doc;
         if (frame.seq > client.lastSentSeq) {
